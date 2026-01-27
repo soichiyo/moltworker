@@ -34,9 +34,6 @@ RUN chmod +x /usr/local/bin/start-clawdbot.sh
 # Copy default configuration template
 COPY clawdbot.json.template /root/.clawdbot-templates/clawdbot.json.template
 
-# Copy build info (deployment-specific metadata)
-COPY build-info.json /root/.clawdbot-templates/build-info.json
-
 # Set working directory
 WORKDIR /root/clawd
 

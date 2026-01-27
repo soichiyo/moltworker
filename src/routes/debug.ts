@@ -9,31 +9,25 @@ import { findExistingClawdbotProcess } from '../gateway';
  */
 const debug = new Hono<AppEnv>();
 
-// GET /debug/version - Returns build info from inside the container
+// GET /debug/version - Returns version info from inside the container
 debug.get('/version', async (c) => {
   const sandbox = c.get('sandbox');
   try {
-    // Read the build info file
-    const buildProcess = await sandbox.startProcess('cat /root/.clawdbot/build-info.json');
-    await new Promise(resolve => setTimeout(resolve, 500));
-    const buildLogs = await buildProcess.getLogs();
-
-    let buildInfo = null;
-    try {
-      buildInfo = JSON.parse(buildLogs.stdout || '{}');
-    } catch {
-      // File might not exist in older deployments
-    }
-
-    // Also get clawdbot version
+    // Get clawdbot version
     const versionProcess = await sandbox.startProcess('clawdbot --version');
     await new Promise(resolve => setTimeout(resolve, 500));
     const versionLogs = await versionProcess.getLogs();
     const clawdbotVersion = (versionLogs.stdout || versionLogs.stderr || '').trim();
 
+    // Get node version
+    const nodeProcess = await sandbox.startProcess('node --version');
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const nodeLogs = await nodeProcess.getLogs();
+    const nodeVersion = (nodeLogs.stdout || '').trim();
+
     return c.json({
-      container: buildInfo || { error: 'build-info.json not found (older deployment?)' },
       clawdbot_version: clawdbotVersion,
+      node_version: nodeVersion,
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';

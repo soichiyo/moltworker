@@ -5,7 +5,6 @@
   "private": true,
   "description": "Run Clawdbot personal AI assistant in a Cloudflare Sandbox",
   "scripts": {
-    "predeploy": "echo \"{\\\"git_hash\\\": \\\"$(git rev-parse --short HEAD)\\\", \\\"git_branch\\\": \\\"$(git rev-parse --abbrev-ref HEAD)\\\", \\\"build_time\\\": \\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\\"}\" > build-info.json",
     "build": "vite build",
     "deploy": "npm run build && wrangler deploy",
     "dev": "vite dev",
