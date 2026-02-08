@@ -58,14 +58,6 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
   // Mount R2 storage for persistent data (non-blocking if not configured)
   const mounted = await mountR2Storage(sandbox, env);
 
-  // Restore config/workspace from R2 BEFORE the startup script runs.
-  // This keeps all s3fs I/O in TypeScript with proper error handling,
-  // so the shell script (which uses set -e) only touches local files.
-  if (mounted) {
-    const restoreResult = await restoreFromR2(sandbox);
-    console.log('[Gateway] R2 restore:', restoreResult.restored ? 'restored' : 'skipped', restoreResult.details || '');
-  }
-
   // Check if gateway is already running or starting
   const existingProcess = await findExistingMoltbotProcess(sandbox);
   if (existingProcess) {
@@ -93,6 +85,19 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
       } catch (killError) {
         console.log('Failed to kill process:', killError);
       }
+    }
+  }
+
+  // Restore config/workspace from R2 BEFORE starting the gateway.
+  // Only runs when starting a NEW gateway (not on every request).
+  // This keeps all s3fs I/O in TypeScript with proper error handling,
+  // so the shell script (which uses set -e) only touches local files.
+  if (mounted) {
+    try {
+      const restoreResult = await restoreFromR2(sandbox);
+      console.log('[Gateway] R2 restore:', restoreResult.restored ? 'restored' : 'skipped', restoreResult.details || '');
+    } catch (err) {
+      console.error('[Gateway] R2 restore failed (non-fatal):', err);
     }
   }
 
