@@ -42,24 +42,34 @@ export async function syncToR2(sandbox: Sandbox, env: MoltbotEnv): Promise<SyncR
   }
 
   // Determine which config directory exists
-  // Check new path first, fall back to legacy
-  // Use exit code (0 = exists) rather than stdout parsing to avoid log-flush races
+  // Use ls + grep instead of test -f to avoid exit code timing issues with the sandbox API
   let configDir = '/root/.openclaw';
   try {
-    const checkNew = await sandbox.startProcess('test -f /root/.openclaw/openclaw.json');
-    await waitForProcess(checkNew, 5000);
-    if (checkNew.exitCode !== 0) {
-      const checkLegacy = await sandbox.startProcess('test -f /root/.clawdbot/clawdbot.json');
-      await waitForProcess(checkLegacy, 5000);
-      if (checkLegacy.exitCode === 0) {
-        configDir = '/root/.clawdbot';
-      } else {
-        return {
-          success: false,
-          error: 'Sync aborted: no config file found',
-          details: 'Neither openclaw.json nor clawdbot.json found in config directory.',
-        };
-      }
+    const checkProc = await sandbox.startProcess(
+      'ls /root/.openclaw/openclaw.json 2>/dev/null && echo FOUND_OPENCLAW || ' +
+      '(ls /root/.clawdbot/clawdbot.json 2>/dev/null && echo FOUND_CLAWDBOT || echo FOUND_NONE)',
+    );
+    await waitForProcess(checkProc, 5000);
+    const checkLogs = await checkProc.getLogs();
+    const checkOutput = checkLogs.stdout || '';
+
+    if (checkOutput.includes('FOUND_OPENCLAW')) {
+      configDir = '/root/.openclaw';
+    } else if (checkOutput.includes('FOUND_CLAWDBOT')) {
+      configDir = '/root/.clawdbot';
+    } else {
+      // Gather diagnostic info
+      const diagProc = await sandbox.startProcess(
+        'echo "=== .openclaw ===" && ls -la /root/.openclaw/ 2>&1 && echo "=== .clawdbot ===" && ls -la /root/.clawdbot/ 2>&1',
+      );
+      await waitForProcess(diagProc, 5000);
+      const diagLogs = await diagProc.getLogs();
+
+      return {
+        success: false,
+        error: 'Sync aborted: no config file found',
+        details: `Neither openclaw.json nor clawdbot.json found. Directory listing: ${diagLogs.stdout || '(empty)'}`,
+      };
     }
   } catch (err) {
     return {
