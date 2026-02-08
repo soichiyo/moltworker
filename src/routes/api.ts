@@ -248,12 +248,13 @@ adminApi.get('/storage', async (c) => {
 adminApi.post('/storage/sync', async (c) => {
   const sandbox = c.get('sandbox');
 
-  // Ensure gateway is running (config file must exist before sync)
-  try {
-    await ensureMoltbotGateway(sandbox, c.env);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : 'Unknown error';
-    return c.json({ success: false, error: 'Gateway not ready', details: msg }, 503);
+  // Quick check: is the gateway running? Config file must exist before sync.
+  const gatewayProcess = await findExistingMoltbotProcess(sandbox);
+  if (!gatewayProcess || gatewayProcess.status !== 'running') {
+    return c.json(
+      { success: false, error: 'Gateway is not running yet. Please wait for it to start.' },
+      503,
+    );
   }
 
   const result = await syncToR2(sandbox, c.env);
