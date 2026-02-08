@@ -27,7 +27,8 @@ src/
 │   ├── process.ts    # Process lifecycle (find, start)
 │   ├── env.ts        # Environment variable building
 │   ├── r2.ts         # R2 bucket mounting
-│   ├── sync.ts       # R2 backup sync logic
+│   ├── restore.ts    # R2 backup restore (runs before startup script)
+│   ├── sync.ts       # R2 backup sync (runs on cron)
 │   └── utils.ts      # Shared utilities (waitForProcess)
 ├── routes/           # API route handlers
 │   ├── api.ts        # /api/* endpoints (devices, gateway)
@@ -86,6 +87,7 @@ Current test coverage:
 - `gateway/env.test.ts` - Environment variable building
 - `gateway/process.test.ts` - Process finding logic
 - `gateway/r2.test.ts` - R2 mounting logic
+- `gateway/restore.test.ts` - R2 backup restore logic
 - `gateway/sync.test.ts` - R2 backup sync logic
 
 When adding new functionality, add corresponding tests.
@@ -137,7 +139,7 @@ Browser
 |------|---------|
 | `src/index.ts` | Worker that manages sandbox lifecycle and proxies requests |
 | `Dockerfile` | Container image based on `cloudflare/sandbox` with Node 22 + OpenClaw |
-| `start-openclaw.sh` | Startup script: R2 restore → onboard → config patch → launch gateway |
+| `start-openclaw.sh` | Startup script: onboard → config patch → launch gateway (NO s3fs ops!) |
 | `wrangler.jsonc` | Cloudflare Worker + Container configuration |
 
 ## Local Development
@@ -175,10 +177,12 @@ The Dockerfile includes a cache bust comment. When changing `start-openclaw.sh`,
 
 OpenClaw configuration is built at container startup:
 
-1. R2 backup is restored if available (with migration from legacy `.clawdbot` paths)
-2. If no config exists, `openclaw onboard --non-interactive` creates one based on env vars
-3. `start-openclaw.sh` patches the config for channels, gateway auth, and trusted proxies
-4. Gateway starts with `openclaw gateway --allow-unconfigured --bind lan`
+1. R2 is mounted by `mountR2Storage()` in TypeScript
+2. Config/workspace/skills restored from R2 by `restoreFromR2()` in TypeScript
+3. `start-openclaw.sh` runs (local files only):
+   a. If no config exists, `openclaw onboard --non-interactive` creates one based on env vars
+   b. Patches config for channels, gateway auth, and trusted proxies
+   c. Gateway starts with `openclaw gateway --allow-unconfigured --bind lan`
 
 ### AI Provider Priority
 
@@ -258,4 +262,39 @@ R2 is mounted via s3fs at `/data/moltbot`. Important gotchas:
 
 - **Process status**: The sandbox API's `proc.status` may not update immediately after a process completes. Instead of checking `proc.status === 'completed'`, verify success by checking for expected output (e.g., timestamp file exists after sync).
 
-- **R2 prefix migration**: Backups are now stored under `openclaw/` prefix in R2 (was `clawdbot/`). The startup script handles restoring from both old and new prefixes with automatic migration.
+- **R2 prefix migration**: Backups are now stored under `openclaw/` prefix in R2 (was `clawdbot/`). The TypeScript restore handles both old and new prefixes with automatic migration.
+
+### R2 Backup Architecture (CRITICAL)
+
+**Rule: No s3fs operations in `start-openclaw.sh`**
+
+The startup script runs with `set -e`, which means ANY command failure kills the process immediately. s3fs (the FUSE filesystem used to mount R2) is inherently unreliable — operations like `test -f`, `cat`, `cp`, and `ls` on `/data/moltbot` can fail due to:
+- Network timeouts
+- Stale mounts
+- S3 transport errors
+- FUSE buffer races
+
+When s3fs operations are in the startup script, these transient failures cause `ProcessExitedBeforeReadyError: Process exited with code 1 before becoming ready. Waiting for: port 18789 (TCP)` because the gateway never starts.
+
+**Correct flow:**
+
+```
+ensureMoltbotGateway() in process.ts:
+  1. mountR2Storage()          ← TypeScript, error handled
+  2. restoreFromR2()           ← TypeScript, error handled (failure = start fresh)
+  3. start-openclaw.sh         ← Shell script, only touches LOCAL files
+     a. onboard (if no config)
+     b. patch config
+     c. start gateway
+  4. waitForPort(18789)
+```
+
+**Files:**
+- `src/gateway/restore.ts` — R2 restore (TypeScript, runs BEFORE shell script)
+- `src/gateway/sync.ts` — R2 backup sync (TypeScript, runs on cron every 5 min)
+- `start-openclaw.sh` — Gateway startup (shell, local files ONLY)
+
+**If you need to add R2-dependent logic:**
+- Add it to TypeScript (`restore.ts` for restore, `sync.ts` for backup)
+- NEVER add it to `start-openclaw.sh`
+- All s3fs I/O must be wrapped in try/catch with graceful fallback

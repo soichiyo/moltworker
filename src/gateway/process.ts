@@ -3,6 +3,7 @@ import type { MoltbotEnv } from '../types';
 import { MOLTBOT_PORT, STARTUP_TIMEOUT_MS } from '../config';
 import { buildEnvVars } from './env';
 import { mountR2Storage } from './r2';
+import { restoreFromR2 } from './restore';
 
 /**
  * Find an existing OpenClaw gateway process
@@ -55,8 +56,15 @@ export async function findExistingMoltbotProcess(sandbox: Sandbox): Promise<Proc
  */
 export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): Promise<Process> {
   // Mount R2 storage for persistent data (non-blocking if not configured)
-  // R2 is used as a backup - the startup script will restore from it on boot
-  await mountR2Storage(sandbox, env);
+  const mounted = await mountR2Storage(sandbox, env);
+
+  // Restore config/workspace from R2 BEFORE the startup script runs.
+  // This keeps all s3fs I/O in TypeScript with proper error handling,
+  // so the shell script (which uses set -e) only touches local files.
+  if (mounted) {
+    const restoreResult = await restoreFromR2(sandbox);
+    console.log('[Gateway] R2 restore:', restoreResult.restored ? 'restored' : 'skipped', restoreResult.details || '');
+  }
 
   // Check if gateway is already running or starting
   const existingProcess = await findExistingMoltbotProcess(sandbox);
