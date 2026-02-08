@@ -248,6 +248,14 @@ adminApi.get('/storage', async (c) => {
 adminApi.post('/storage/sync', async (c) => {
   const sandbox = c.get('sandbox');
 
+  // Ensure gateway is running (config file must exist before sync)
+  try {
+    await ensureMoltbotGateway(sandbox, c.env);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    return c.json({ success: false, error: 'Gateway not ready', details: msg }, 503);
+  }
+
   const result = await syncToR2(sandbox, c.env);
 
   if (result.success) {
