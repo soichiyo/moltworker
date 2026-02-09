@@ -8,6 +8,7 @@
  * @param proc - Process object with status property
  * @param timeoutMs - Maximum time to wait in milliseconds
  * @param pollIntervalMs - How often to check status (default 500ms)
+ * @throws {Error} If the process was canceled (e.g., due to Durable Object reset)
  */
 export async function waitForProcess(
   proc: { status: string },
@@ -20,5 +21,10 @@ export async function waitForProcess(
     // eslint-disable-next-line no-await-in-loop -- intentional sequential polling
     await new Promise((r) => setTimeout(r, pollIntervalMs));
     attempts++;
+  }
+
+  // Detect if the process was canceled (e.g., due to Durable Object reset during deployment)
+  if (proc.status === 'canceled') {
+    throw new Error('Process was canceled (Durable Object reset?)');
   }
 }

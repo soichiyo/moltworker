@@ -94,9 +94,43 @@ export async function ensureMoltbotGateway(sandbox: Sandbox, env: MoltbotEnv): P
   // so the shell script (which uses set -e) only touches local files.
   if (mounted) {
     try {
-      const restoreResult = await restoreFromR2(sandbox);
-      console.log('[Gateway] R2 restore:', restoreResult.restored ? 'restored' : 'skipped', restoreResult.details || '');
+      let restoreResult = await restoreFromR2(sandbox);
+      console.log(
+        '[Gateway] R2 restore:',
+        restoreResult.restored ? 'restored' : 'skipped',
+        restoreResult.details || '',
+      );
+
+      // If DO reset was detected during restore, abort gateway startup.
+      // The caller should retry the request after the DO stabilizes.
+      if (!restoreResult.restored && restoreResult.details === 'DO reset during restore') {
+        throw new Error(
+          'Gateway startup aborted: Durable Object is resetting (likely due to deployment). Please retry in a moment.',
+        );
+      }
+
+      // If R2 is mounted but we couldn't find any backup markers, the mount might be stale/empty.
+      // Retry once with a forced remount to avoid starting "fresh" and overwriting local state.
+      if (!restoreResult.restored && restoreResult.details === 'No backup data found') {
+        console.warn('[Gateway] No backup detected on mounted R2. Forcing remount and retrying restore...');
+        const remounted = await mountR2Storage(sandbox, env, { forceRemount: true });
+        if (remounted) {
+          restoreResult = await restoreFromR2(sandbox);
+          console.log(
+            '[Gateway] R2 restore (after remount):',
+            restoreResult.restored ? 'restored' : 'skipped',
+            restoreResult.details || '',
+          );
+        } else {
+          console.warn('[Gateway] Forced remount failed, continuing without restore');
+        }
+      }
     } catch (err) {
+      // Rethrow DO reset errors so the caller can handle them appropriately
+      if (err instanceof Error && err.message.includes('Durable Object is resetting')) {
+        throw err;
+      }
+      // Other errors are non-fatal - we'll start fresh
       console.error('[Gateway] R2 restore failed (non-fatal):', err);
     }
   }
