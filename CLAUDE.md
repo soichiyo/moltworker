@@ -124,6 +124,62 @@ npm test  # 全テスト実行
 - `/data/moltbot/*` を削除すると R2 データが消える
 - バックアップは `openclaw/` プレフィックスで保存（レガシー `clawdbot/` も対応）
 
+## OpenClaw ノードへの接続
+
+デプロイした Worker を OpenClaw CLI から使用するには:
+
+### ペアリングコードの取得
+
+**Admin UI (`/_admin/`) にはペアリングコードの表示機能がありません。**
+ペアリングコードは Gateway のログに出力されます。
+
+取得方法:
+
+1. **デバッグエンドポイント（`DEBUG_ROUTES=true` が必要）**
+   ```bash
+   curl https://your-worker.workers.dev/debug/logs | jq -r '.stdout' | grep -i "pairing"
+   ```
+
+2. **wrangler tail でリアルタイムログを確認**
+   ```bash
+   npx wrangler tail
+   # デプロイまたは Gateway 再起動時の起動ログにペアリングコードが表示される
+   ```
+
+### 接続手順
+
+```bash
+# 1. デプロイ
+npm run deploy
+
+# 2. 2〜3 分待つ（Gateway 起動）
+
+# 3. ログからペアリングコードを取得
+npx wrangler tail
+# または
+curl https://your-worker.workers.dev/debug/logs | jq -r '.stdout'
+
+# 4. ローカルマシンでペアリング
+openclaw pair <PAIRING_CODE>
+
+# 5. Admin UI でペアリングリクエストを承認（ペアリングモードの場合）
+
+# 6. SSH 接続
+openclaw ssh
+```
+
+### トークン認証を使う場合
+
+`MOLTBOT_GATEWAY_TOKEN` を設定すれば、デバイスペアリング不要でトークン認証できます:
+
+```bash
+npx wrangler secret put MOLTBOT_GATEWAY_TOKEN
+# トークンを入力
+
+# 接続時
+openclaw connect --url wss://your-worker.workers.dev --token <TOKEN>
+```
+
 ## 詳細なドキュメント
 
 `AGENTS.md` にさらに詳しいアーキテクチャ情報、環境変数一覧、よくあるタスクの手順がある。

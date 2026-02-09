@@ -6,9 +6,11 @@ Guidelines for AI agents working on this codebase.
 
 This is a Cloudflare Worker that runs [OpenClaw](https://github.com/openclaw/openclaw) (formerly Moltbot/Clawdbot) in a Cloudflare Sandbox container. It provides:
 - Proxying to the OpenClaw gateway (web UI + WebSocket)
-- Admin UI at `/_admin/` for device management
+- Admin UI at `/_admin/` for device management (approve pairing requests, view paired devices)
 - API endpoints at `/api/*` for device pairing
 - Debug endpoints at `/debug/*` for troubleshooting
+
+**Note on pairing:** The Admin UI does NOT display the pairing code. To get the pairing code, check the gateway logs via `/debug/logs` or `wrangler tail`.
 
 **Note:** The CLI tool and npm package are now named `openclaw`. Config files use `.openclaw/openclaw.json`. Legacy `.clawdbot` paths are supported for backward compatibility during transition.
 
@@ -249,6 +251,35 @@ npx wrangler secret list
 ```
 
 Enable debug routes with `DEBUG_ROUTES=true` and check `/debug/processes`.
+
+### Getting Pairing Code for OpenClaw CLI
+
+The OpenClaw Gateway generates a pairing code on startup, which is output to stdout. To retrieve it:
+
+**Method 1: Debug endpoint** (requires `DEBUG_ROUTES=true`)
+```bash
+curl https://your-worker.workers.dev/debug/logs | jq -r '.stdout' | grep -i "pairing"
+```
+
+**Method 2: Live logs**
+```bash
+npx wrangler tail
+# Deploy or restart gateway, watch for pairing code in startup logs
+```
+
+**Method 3: Admin UI**
+The Admin UI (`/_admin/`) shows pending pairing requests and allows you to approve devices, but does NOT display the pairing code itself. The pairing code is needed to initiate the connection from the OpenClaw CLI.
+
+**Pairing workflow:**
+1. Deploy the worker: `npm run deploy`
+2. Wait 2-3 minutes for gateway to start
+3. Get pairing code from logs (method 1 or 2 above)
+4. On your local machine: `openclaw pair <CODE>`
+5. Approve the pairing request in Admin UI (if using pairing mode)
+6. Connect: `openclaw ssh`
+
+**Alternative: Token-based auth**
+If you set `MOLTBOT_GATEWAY_TOKEN` via wrangler secrets, the gateway will use token auth instead of device pairing, bypassing the need for a pairing code entirely.
 
 ## R2 Storage Notes
 
