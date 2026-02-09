@@ -16,18 +16,36 @@ if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
     exit 0
 fi
 
-CONFIG_DIR="/root/.openclaw"
-CONFIG_FILE="$CONFIG_DIR/openclaw.json"
+# Store config/workspace in R2 mount for immediate persistence
+R2_CONFIG_DIR="/data/moltbot/openclaw"
+CONFIG_LINK="/root/.openclaw"
+CONFIG_FILE="$CONFIG_LINK/openclaw.json"
 
-echo "Config directory: $CONFIG_DIR"
+echo "[start-openclaw] R2 config directory: $R2_CONFIG_DIR"
 
-mkdir -p "$CONFIG_DIR"
+# Create R2 directory if it doesn't exist
+mkdir -p "$R2_CONFIG_DIR"
+
+# Create symlink to R2 directory (overwrites existing link or directory)
+# This ensures all OpenClaw writes go directly to R2 mount
+if [ -e "$CONFIG_LINK" ] && [ ! -L "$CONFIG_LINK" ]; then
+    echo "[start-openclaw] Moving existing config to R2..."
+    cp -a "$CONFIG_LINK"/* "$R2_CONFIG_DIR/" 2>/dev/null || true
+    rm -rf "$CONFIG_LINK"
+fi
+
+if [ ! -L "$CONFIG_LINK" ]; then
+    echo "[start-openclaw] Creating symlink: $CONFIG_LINK -> $R2_CONFIG_DIR"
+    ln -sf "$R2_CONFIG_DIR" "$CONFIG_LINK"
+fi
+
+echo "[start-openclaw] Config directory: $CONFIG_LINK -> $R2_CONFIG_DIR"
 
 # ============================================================
 # ONBOARD (only if no config exists yet)
 # ============================================================
 if [ ! -f "$CONFIG_FILE" ]; then
-    echo "No existing config found, running openclaw onboard..."
+    echo "[start-openclaw] First run detected, running onboard..."
 
     AUTH_ARGS=""
     if [ -n "$CLOUDFLARE_AI_GATEWAY_API_KEY" ] && [ -n "$CF_AI_GATEWAY_ACCOUNT_ID" ] && [ -n "$CF_AI_GATEWAY_GATEWAY_ID" ]; then
@@ -50,30 +68,26 @@ if [ ! -f "$CONFIG_FILE" ]; then
         --skip-skills \
         --skip-health
 
-    echo "Onboard completed"
-else
-    echo "Using existing config"
-fi
-
-# ============================================================
-# PATCH CONFIG (channels, gateway auth, trusted proxies)
-# ============================================================
-# openclaw onboard handles provider/model config, but we need to patch in:
-# - Channel config (Telegram, Discord, Slack)
-# - Gateway token auth
-# - Trusted proxies for sandbox networking
-# - Base URL override for legacy AI Gateway path
-node << 'EOFPATCH'
+    # ============================================================
+    # PATCH CONFIG (channels, gateway auth, trusted proxies)
+    # ============================================================
+    # openclaw onboard handles provider/model config, but we need to patch in:
+    # - Channel config (Telegram, Discord, Slack)
+    # - Gateway token auth
+    # - Trusted proxies for sandbox networking
+    # - Base URL override for legacy AI Gateway path
+    node << 'EOFPATCH'
 const fs = require('fs');
 
+// Config is accessed via symlink at /root/.openclaw
 const configPath = '/root/.openclaw/openclaw.json';
-console.log('Patching config at:', configPath);
+console.log('[start-openclaw] Patching config at:', configPath);
 let config = {};
 
 try {
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 } catch (e) {
-    console.log('Starting with empty config');
+    console.log('[start-openclaw] Starting with empty config');
 }
 
 config.gateway = config.gateway || {};
@@ -138,9 +152,9 @@ if (process.env.CF_AI_GATEWAY_MODEL) {
         config.agents = config.agents || {};
         config.agents.defaults = config.agents.defaults || {};
         config.agents.defaults.model = { primary: providerName + '/' + modelId };
-        console.log('AI Gateway model override: provider=' + providerName + ' model=' + modelId + ' via ' + baseUrl);
+        console.log('[start-openclaw] AI Gateway model override: provider=' + providerName + ' model=' + modelId + ' via ' + baseUrl);
     } else {
-        console.warn('CF_AI_GATEWAY_MODEL set but missing required config (account ID, gateway ID, or API key)');
+        console.warn('[start-openclaw] CF_AI_GATEWAY_MODEL set but missing required config (account ID, gateway ID, or API key)');
     }
 }
 
@@ -186,8 +200,13 @@ if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
 }
 
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-console.log('Configuration patched successfully');
+console.log('[start-openclaw] Configuration patched successfully');
 EOFPATCH
+
+    echo "[start-openclaw] Initial setup complete"
+else
+    echo "[start-openclaw] Config exists, skipping onboard"
+fi
 
 # ============================================================
 # START GATEWAY

@@ -11,33 +11,56 @@ export interface RestoreResult {
 /**
  * Restore OpenClaw config and workspace from R2 backup before the gateway starts.
  *
- * This runs BEFORE start-openclaw.sh so the startup script only deals with
- * local files. All s3fs-dependent I/O happens here with proper error handling
- * — a failure simply means "start fresh" instead of crashing the startup script.
+ * With the new architecture, config/workspace lives directly in R2 mount (/data/moltbot/openclaw).
+ * The startup script creates a symlink: /root/.openclaw -> /data/moltbot/openclaw
  *
- * The config directory (/root/.openclaw/) includes workspace/ as a subdirectory,
- * so restoring the config also restores the workspace (IDENTITY.md, MEMORY.md, memory/, etc.).
+ * This function now only needs to:
+ * 1. Check if R2 data exists at /data/moltbot/openclaw
+ * 2. Migrate legacy data if needed (from old backup locations)
+ * 3. Return success (data is already available via R2 mount)
  *
- * Restores from:
- * - Config+Workspace: R2:/openclaw/ (or legacy R2:/clawdbot/) → /root/.openclaw/
- * - Legacy migration: R2:/workspace/ → merged into /root/.openclaw/workspace/ (if exists)
- * - Legacy migration: R2:/skills/ → merged into /root/.openclaw/workspace/skills/ (if exists)
+ * Legacy migration paths (for backward compatibility):
+ * - R2:/workspace/ → merged into R2:/openclaw/workspace/ (if exists)
+ * - R2:/skills/ → merged into R2:/openclaw/workspace/skills/ (if exists)
  */
 export async function restoreFromR2(sandbox: Sandbox): Promise<RestoreResult> {
   const BACKUP_DIR = R2_MOUNT_PATH;
-  const CONFIG_DIR = '/root/.openclaw';
+  // Config now lives directly in R2 mount (symlinked from /root/.openclaw)
+  const R2_CONFIG_DIR = `${BACKUP_DIR}/openclaw`;
 
-  // Determine which backup format exists (new openclaw/ or legacy clawdbot/)
-  let backupConfigDir: string | null = null;
-  let needsMigration = false;
-
+  // Check if config already exists in R2 mount (primary location)
   try {
-    const checkNew = await sandbox.startProcess(
-      `test -f ${BACKUP_DIR}/openclaw/openclaw.json`,
+    const checkR2Config = await sandbox.startProcess(
+      `test -f ${R2_CONFIG_DIR}/openclaw.json || test -f ${R2_CONFIG_DIR}/clawdbot.json`,
     );
-    await waitForProcess(checkNew, 5000);
-    if (checkNew.exitCode === 0) {
-      backupConfigDir = `${BACKUP_DIR}/openclaw`;
+    await waitForProcess(checkR2Config, 5000);
+
+    if (checkR2Config.exitCode === 0) {
+      console.log('[Restore] Config already exists in R2 mount at', R2_CONFIG_DIR);
+
+      // Migrate clawdbot.json to openclaw.json if needed
+      try {
+        const migrateProc = await sandbox.startProcess(
+          `test -f ${R2_CONFIG_DIR}/clawdbot.json && ! test -f ${R2_CONFIG_DIR}/openclaw.json && mv ${R2_CONFIG_DIR}/clawdbot.json ${R2_CONFIG_DIR}/openclaw.json || true`,
+        );
+        await waitForProcess(migrateProc, 5000);
+      } catch {
+        // non-fatal
+      }
+
+      // Migrate legacy data if present
+      let legacyMigrated = false;
+      legacyMigrated = await migrateLegacyWorkspace(sandbox, BACKUP_DIR, R2_CONFIG_DIR);
+      await migrateLegacySkills(sandbox, BACKUP_DIR, R2_CONFIG_DIR);
+
+      // Validate data quality
+      await validateRestore(sandbox, R2_CONFIG_DIR);
+
+      return {
+        restored: true,
+        details: 'Data already in R2 mount',
+        legacyMigrated: legacyMigrated || undefined,
+      };
     }
   } catch (err) {
     // If the process was canceled (DO reset), abort restore and let caller retry
@@ -45,127 +68,81 @@ export async function restoreFromR2(sandbox: Sandbox): Promise<RestoreResult> {
       console.log('[Restore] Process canceled (DO reset detected), aborting restore');
       return { restored: false, details: 'DO reset during restore' };
     }
-    // Otherwise ignore — will try legacy path
+    // Otherwise continue to check legacy locations
   }
 
-  if (!backupConfigDir) {
-    try {
-      const checkLegacy = await sandbox.startProcess(
-        `test -f ${BACKUP_DIR}/clawdbot/clawdbot.json`,
-      );
-      await waitForProcess(checkLegacy, 5000);
-      if (checkLegacy.exitCode === 0) {
-        backupConfigDir = `${BACKUP_DIR}/clawdbot`;
-        needsMigration = true;
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.includes('canceled')) {
-        console.log('[Restore] Process canceled (DO reset detected), aborting restore');
-        return { restored: false, details: 'DO reset during restore' };
-      }
-      // Otherwise ignore
+  // Check legacy backup locations and migrate if found
+  console.log('[Restore] No config in R2 mount, checking legacy backup locations...');
+
+  let legacySourceDir: string | null = null;
+
+  // Check R2:/clawdbot/ (legacy backup location)
+  try {
+    const checkLegacyDir = await sandbox.startProcess(
+      `test -f ${BACKUP_DIR}/clawdbot/clawdbot.json`,
+    );
+    await waitForProcess(checkLegacyDir, 5000);
+    if (checkLegacyDir.exitCode === 0) {
+      legacySourceDir = `${BACKUP_DIR}/clawdbot`;
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('canceled')) {
+      console.log('[Restore] Process canceled (DO reset detected), aborting restore');
+      return { restored: false, details: 'DO reset during restore' };
     }
   }
 
-  if (!backupConfigDir) {
+  // Check R2:/clawdbot.json (flat legacy backup)
+  if (!legacySourceDir) {
     try {
-      const checkFlat = await sandbox.startProcess(
+      const checkLegacyFlat = await sandbox.startProcess(
         `test -f ${BACKUP_DIR}/clawdbot.json`,
       );
-      await waitForProcess(checkFlat, 5000);
-      if (checkFlat.exitCode === 0) {
-        backupConfigDir = BACKUP_DIR;
-        needsMigration = true;
+      await waitForProcess(checkLegacyFlat, 5000);
+      if (checkLegacyFlat.exitCode === 0) {
+        legacySourceDir = BACKUP_DIR;
       }
     } catch (err) {
       if (err instanceof Error && err.message.includes('canceled')) {
         console.log('[Restore] Process canceled (DO reset detected), aborting restore');
         return { restored: false, details: 'DO reset during restore' };
       }
-      // Otherwise ignore
     }
   }
 
-  if (!backupConfigDir) {
-    // Diagnostic: show what the mounted bucket looks like. This helps distinguish:
-    // - Empty/wrong bucket mounted
-    // - Stale mount showing empty listings
-    // - Permission issues (ls errors)
+  if (legacySourceDir) {
+    // Migrate legacy backup to new R2 location
+    console.log('[Restore] Migrating legacy backup from', legacySourceDir, 'to', R2_CONFIG_DIR);
     try {
-      const diagCmd = [
-        `echo "=== R2 root (${BACKUP_DIR}) ==="`,
-        `ls -la ${BACKUP_DIR} 2>&1 | head -100 || true`,
-        `echo "=== R2 openclaw dir (${BACKUP_DIR}/openclaw) ==="`,
-        `ls -la ${BACKUP_DIR}/openclaw 2>&1 | head -100 || true`,
-        `echo "=== R2 clawdbot dir (${BACKUP_DIR}/clawdbot) ==="`,
-        `ls -la ${BACKUP_DIR}/clawdbot 2>&1 | head -100 || true`,
-        `echo "=== R2 last-sync (${BACKUP_DIR}/.last-sync) ==="`,
-        `cat ${BACKUP_DIR}/.last-sync 2>&1 | head -20 || true`,
-      ].join('; ');
-      const proc = await sandbox.startProcess(diagCmd);
-      await waitForProcess(proc, 10000);
-      const logs = await proc.getLogs();
-      console.log('[Restore] No R2 backup data found, starting fresh. Diagnostic:\n' + (logs.stdout || '').trim());
-      return { restored: false, details: 'No backup data found', legacyMigrated: undefined };
-    } catch {
-      console.log('[Restore] No R2 backup data found, starting fresh');
-      return { restored: false, details: 'No backup data found' };
+      const migrateCmd = [
+        `mkdir -p ${R2_CONFIG_DIR}`,
+        `cp -a ${legacySourceDir}/. ${R2_CONFIG_DIR}/`,
+        `test -f ${R2_CONFIG_DIR}/clawdbot.json && ! test -f ${R2_CONFIG_DIR}/openclaw.json && mv ${R2_CONFIG_DIR}/clawdbot.json ${R2_CONFIG_DIR}/openclaw.json || true`,
+      ].join(' && ');
+      const proc = await sandbox.startProcess(migrateCmd);
+      await waitForProcess(proc, 15000);
+      console.log('[Restore] Legacy backup migrated successfully');
+    } catch (err) {
+      console.error('[Restore] Failed to migrate legacy backup:', err);
+      return { restored: false, details: 'Legacy migration failed' };
     }
+  } else {
+    // No backup data found anywhere
+    console.log('[Restore] No backup data found, starting fresh');
+    return { restored: false, details: 'No backup data found' };
   }
 
-  // Check if R2 backup is newer than local data
-  if (!await shouldRestore(sandbox, BACKUP_DIR, CONFIG_DIR)) {
-    return { restored: false, details: 'Local data is newer or same' };
-  }
-
-  // Restore config (includes workspace/ subdirectory)
-  console.log('[Restore] Restoring config from', backupConfigDir);
-  try {
-    const restoreCmd = [
-      `mkdir -p ${CONFIG_DIR}`,
-      `cp -a ${backupConfigDir}/. ${CONFIG_DIR}/`,
-      `cp -f ${BACKUP_DIR}/.last-sync ${CONFIG_DIR}/.last-sync 2>/dev/null || true`,
-    ].join(' && ');
-    const proc = await sandbox.startProcess(restoreCmd);
-    await waitForProcess(proc, 15000);
-
-    if (needsMigration) {
-      const migrateProc = await sandbox.startProcess(
-        `test -f ${CONFIG_DIR}/clawdbot.json && ! test -f ${CONFIG_DIR}/openclaw.json && mv ${CONFIG_DIR}/clawdbot.json ${CONFIG_DIR}/openclaw.json || true`,
-      );
-      await waitForProcess(migrateProc, 5000);
-    }
-
-    // Write a local marker so sync can distinguish "restore succeeded"
-    // even when .last-sync is missing in older backups.
-    try {
-      const markerProc = await sandbox.startProcess(
-        `date -Iseconds > ${CONFIG_DIR}/.r2-restored 2>/dev/null || echo "restored" > ${CONFIG_DIR}/.r2-restored`,
-      );
-      await waitForProcess(markerProc, 5000);
-    } catch {
-      // non-fatal
-    }
-
-    console.log('[Restore] Config restored successfully');
-  } catch (err) {
-    console.error('[Restore] Failed to restore config:', err);
-    return { restored: false, details: 'Config restore failed' };
-  }
-
-  // Migrate legacy R2:/workspace/ data into config workspace (non-fatal)
+  // Migrate legacy workspace/skills data if present
   let legacyMigrated = false;
-  legacyMigrated = await migrateLegacyWorkspace(sandbox, BACKUP_DIR, CONFIG_DIR);
-
-  // Migrate legacy R2:/skills/ data into config workspace (non-fatal)
-  await migrateLegacySkills(sandbox, BACKUP_DIR, CONFIG_DIR);
+  legacyMigrated = await migrateLegacyWorkspace(sandbox, BACKUP_DIR, R2_CONFIG_DIR);
+  await migrateLegacySkills(sandbox, BACKUP_DIR, R2_CONFIG_DIR);
 
   // Validate restore quality
-  await validateRestore(sandbox, CONFIG_DIR);
+  await validateRestore(sandbox, R2_CONFIG_DIR);
 
   return {
     restored: true,
-    details: `Restored from ${backupConfigDir}`,
+    details: legacySourceDir ? `Migrated from ${legacySourceDir}` : 'Restored',
     legacyMigrated: legacyMigrated || undefined,
   };
 }
