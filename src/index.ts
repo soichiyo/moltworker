@@ -197,6 +197,15 @@ app.use('*', async (c, next) => {
 
 // Middleware: Cloudflare Access authentication for protected routes
 app.use('*', async (c, next) => {
+  // WebSocket clients (OpenClaw CLI / node hosts) won't have a CF Access JWT.
+  // We rely on the gateway's own token auth for WS connections instead.
+  //
+  // UI/API routes remain protected by Cloudflare Access.
+  const upgrade = c.req.header('Upgrade')?.toLowerCase();
+  if (upgrade === 'websocket') {
+    return next();
+  }
+
   // Determine response type based on Accept header
   const acceptsHtml = c.req.header('Accept')?.includes('text/html');
   const middleware = createAccessMiddleware({
@@ -233,12 +242,157 @@ app.all('*', async (c) => {
 
   console.log('[PROXY] Handling request:', url.pathname);
 
+  const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+
+  // WebSocket proxy: accept immediately to avoid client handshake timeouts,
+  // then connect to the container in the background and bridge frames.
+  if (isWebSocketRequest) {
+    const debugLogs = c.env.DEBUG_ROUTES === 'true';
+    const redactedSearch = redactSensitiveParams(url);
+
+    // OpenClaw's Node Host connects at the origin root (`wss://host:port`),
+    // but the gateway is exposed at `/ws` through this Worker.
+    const rewrittenUrl = new URL(url.toString());
+    if (rewrittenUrl.pathname === '/') rewrittenUrl.pathname = '/ws';
+
+    // Inject gateway token into WebSocket request if not already present.
+    // CF Access redirects can strip query params, so authenticated users lose ?token=.
+    // Since the user already passed CF Access auth, we inject the token server-side.
+    if (c.env.MOLTBOT_GATEWAY_TOKEN && !rewrittenUrl.searchParams.has('token')) {
+      rewrittenUrl.searchParams.set('token', c.env.MOLTBOT_GATEWAY_TOKEN);
+    }
+
+    console.log('[WS] Accepting client WebSocket (async bridge)');
+    if (debugLogs) {
+      console.log('[WS] URL:', rewrittenUrl.pathname + redactSensitiveParams(rewrittenUrl));
+    }
+
+    const [clientWs, serverWs] = Object.values(new WebSocketPair());
+    serverWs.accept();
+
+    // Buffer client -> container messages until the container WebSocket is ready.
+    const pendingToContainer: Array<string | ArrayBuffer> = [];
+    let containerWs: WebSocket | null = null;
+    let containerReady = false;
+
+    const flushPending = () => {
+      if (!containerWs || containerWs.readyState !== WebSocket.OPEN) return;
+      for (const msg of pendingToContainer.splice(0)) {
+        try {
+          containerWs.send(msg);
+        } catch {
+          // Ignore send errors; close handler will clean up.
+        }
+      }
+    };
+
+    // Relay messages from client to container (or buffer until ready)
+    serverWs.addEventListener('message', (event) => {
+      const data = event.data as string | ArrayBuffer;
+      if (containerReady && containerWs && containerWs.readyState === WebSocket.OPEN) {
+        containerWs.send(data);
+      } else {
+        // Limit buffer growth to avoid unbounded memory during cold starts.
+        if (pendingToContainer.length < 256) pendingToContainer.push(data);
+      }
+    });
+
+    // If the client closes early, propagate to container once connected.
+    serverWs.addEventListener('close', (event) => {
+      if (containerWs && containerWs.readyState === WebSocket.OPEN) {
+        containerWs.close(event.code, event.reason);
+      }
+    });
+
+    serverWs.addEventListener('error', (event) => {
+      console.error('[WS] Client error:', event);
+      try {
+        containerWs?.close(1011, 'Client error');
+      } catch {
+        // ignore
+      }
+    });
+
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          // Cold-start the gateway if needed.
+          await ensureMoltbotGateway(sandbox, c.env);
+
+          // Create a new Request with the rewritten URL so Sandbox wsConnect targets /ws.
+          const wsRequest = new Request(rewrittenUrl.toString(), request);
+
+          // Get WebSocket connection to the container
+          const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
+          console.log('[WS] wsConnect response status:', containerResponse.status);
+
+          const cw = containerResponse.webSocket;
+          if (!cw) {
+            console.error('[WS] No WebSocket in container response');
+            serverWs.close(1011, 'No container WebSocket');
+            return;
+          }
+
+          containerWs = cw;
+          containerWs.accept();
+          containerReady = true;
+          flushPending();
+
+          // Relay messages from container to client, with error transformation
+          containerWs.addEventListener('message', (event) => {
+            let data = event.data;
+            if (typeof data === 'string') {
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed.error?.message) {
+                  parsed.error.message = transformErrorMessage(parsed.error.message, url.host);
+                  data = JSON.stringify(parsed);
+                }
+              } catch {
+                // Not JSON; passthrough
+              }
+            }
+            if (serverWs.readyState === WebSocket.OPEN) serverWs.send(data);
+          });
+
+          containerWs.addEventListener('close', (event) => {
+            let reason = transformErrorMessage(event.reason, url.host);
+            if (reason.length > 123) reason = reason.slice(0, 120) + '...';
+            if (serverWs.readyState === WebSocket.OPEN) serverWs.close(event.code, reason);
+          });
+
+          containerWs.addEventListener('error', (event) => {
+            console.error('[WS] Container error:', event);
+            try {
+              if (serverWs.readyState === WebSocket.OPEN) serverWs.close(1011, 'Container error');
+            } catch {
+              // ignore
+            }
+          });
+        } catch (err) {
+          console.error('[WS] Async bridge failed:', err);
+          try {
+            if (serverWs.readyState === WebSocket.OPEN) {
+              serverWs.close(1011, err instanceof Error ? err.message : 'Bridge failed');
+            }
+          } catch {
+            // ignore
+          }
+        }
+      })(),
+    );
+
+    return new Response(null, {
+      status: 101,
+      webSocket: clientWs,
+    });
+  }
+
   // Check if gateway is already running
   const existingProcess = await findExistingMoltbotProcess(sandbox);
   const isGatewayReady = existingProcess !== null && existingProcess.status === 'running';
 
   // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
-  const isWebSocketRequest = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   const acceptsHtml = request.headers.get('Accept')?.includes('text/html');
 
   if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
@@ -277,155 +431,6 @@ app.all('*', async (c) => {
       },
       503,
     );
-  }
-
-  // Proxy to Moltbot with WebSocket message interception
-  if (isWebSocketRequest) {
-    const debugLogs = c.env.DEBUG_ROUTES === 'true';
-    const redactedSearch = redactSensitiveParams(url);
-
-    console.log('[WS] Proxying WebSocket connection to Moltbot');
-    if (debugLogs) {
-      console.log('[WS] URL:', url.pathname + redactedSearch);
-    }
-
-    // Inject gateway token into WebSocket request if not already present.
-    // CF Access redirects strip query params, so authenticated users lose ?token=.
-    // Since the user already passed CF Access auth, we inject the token server-side.
-    let wsRequest = request;
-    if (c.env.MOLTBOT_GATEWAY_TOKEN && !url.searchParams.has('token')) {
-      const tokenUrl = new URL(url.toString());
-      tokenUrl.searchParams.set('token', c.env.MOLTBOT_GATEWAY_TOKEN);
-      wsRequest = new Request(tokenUrl.toString(), request);
-    }
-
-    // Get WebSocket connection to the container
-    const containerResponse = await sandbox.wsConnect(wsRequest, MOLTBOT_PORT);
-    console.log('[WS] wsConnect response status:', containerResponse.status);
-
-    // Get the container-side WebSocket
-    const containerWs = containerResponse.webSocket;
-    if (!containerWs) {
-      console.error('[WS] No WebSocket in container response - falling back to direct proxy');
-      return containerResponse;
-    }
-
-    if (debugLogs) {
-      console.log('[WS] Got container WebSocket, setting up interception');
-    }
-
-    // Create a WebSocket pair for the client
-    const [clientWs, serverWs] = Object.values(new WebSocketPair());
-
-    // Accept both WebSockets
-    serverWs.accept();
-    containerWs.accept();
-
-    if (debugLogs) {
-      console.log('[WS] Both WebSockets accepted');
-      console.log('[WS] containerWs.readyState:', containerWs.readyState);
-      console.log('[WS] serverWs.readyState:', serverWs.readyState);
-    }
-
-    // Relay messages from client to container
-    serverWs.addEventListener('message', (event) => {
-      if (debugLogs) {
-        console.log(
-          '[WS] Client -> Container:',
-          typeof event.data,
-          typeof event.data === 'string' ? event.data.slice(0, 200) : '(binary)',
-        );
-      }
-      if (containerWs.readyState === WebSocket.OPEN) {
-        containerWs.send(event.data);
-      } else if (debugLogs) {
-        console.log('[WS] Container not open, readyState:', containerWs.readyState);
-      }
-    });
-
-    // Relay messages from container to client, with error transformation
-    containerWs.addEventListener('message', (event) => {
-      if (debugLogs) {
-        console.log(
-          '[WS] Container -> Client (raw):',
-          typeof event.data,
-          typeof event.data === 'string' ? event.data.slice(0, 500) : '(binary)',
-        );
-      }
-      let data = event.data;
-
-      // Try to intercept and transform error messages
-      if (typeof data === 'string') {
-        try {
-          const parsed = JSON.parse(data);
-          if (debugLogs) {
-            console.log('[WS] Parsed JSON, has error.message:', !!parsed.error?.message);
-          }
-          if (parsed.error?.message) {
-            if (debugLogs) {
-              console.log('[WS] Original error.message:', parsed.error.message);
-            }
-            parsed.error.message = transformErrorMessage(parsed.error.message, url.host);
-            if (debugLogs) {
-              console.log('[WS] Transformed error.message:', parsed.error.message);
-            }
-            data = JSON.stringify(parsed);
-          }
-        } catch (e) {
-          if (debugLogs) {
-            console.log('[WS] Not JSON or parse error:', e);
-          }
-        }
-      }
-
-      if (serverWs.readyState === WebSocket.OPEN) {
-        serverWs.send(data);
-      } else if (debugLogs) {
-        console.log('[WS] Server not open, readyState:', serverWs.readyState);
-      }
-    });
-
-    // Handle close events
-    serverWs.addEventListener('close', (event) => {
-      if (debugLogs) {
-        console.log('[WS] Client closed:', event.code, event.reason);
-      }
-      containerWs.close(event.code, event.reason);
-    });
-
-    containerWs.addEventListener('close', (event) => {
-      if (debugLogs) {
-        console.log('[WS] Container closed:', event.code, event.reason);
-      }
-      // Transform the close reason (truncate to 123 bytes max for WebSocket spec)
-      let reason = transformErrorMessage(event.reason, url.host);
-      if (reason.length > 123) {
-        reason = reason.slice(0, 120) + '...';
-      }
-      if (debugLogs) {
-        console.log('[WS] Transformed close reason:', reason);
-      }
-      serverWs.close(event.code, reason);
-    });
-
-    // Handle errors
-    serverWs.addEventListener('error', (event) => {
-      console.error('[WS] Client error:', event);
-      containerWs.close(1011, 'Client error');
-    });
-
-    containerWs.addEventListener('error', (event) => {
-      console.error('[WS] Container error:', event);
-      serverWs.close(1011, 'Container error');
-    });
-
-    if (debugLogs) {
-      console.log('[WS] Returning intercepted WebSocket response');
-    }
-    return new Response(null, {
-      status: 101,
-      webSocket: clientWs,
-    });
   }
 
   console.log('[HTTP] Proxying:', url.pathname + url.search);

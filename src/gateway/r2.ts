@@ -33,7 +33,27 @@ async function isR2Mounted(sandbox: Sandbox): Promise<boolean> {
  * @param env - Worker environment bindings
  * @returns true if mounted successfully, false otherwise
  */
-export async function mountR2Storage(sandbox: Sandbox, env: MoltbotEnv): Promise<boolean> {
+export interface MountR2StorageOptions {
+  /**
+   * Best-effort unmount + remount.
+   * Used to recover from stale s3fs mounts that appear mounted but contain no data.
+   */
+  forceRemount?: boolean;
+}
+
+export async function mountR2Storage(
+  sandbox: Sandbox,
+  env: MoltbotEnv,
+  options: MountR2StorageOptions = {},
+): Promise<boolean> {
+  return mountR2StorageWithOptions(sandbox, env, options);
+}
+
+export async function mountR2StorageWithOptions(
+  sandbox: Sandbox,
+  env: MoltbotEnv,
+  options: MountR2StorageOptions = {},
+): Promise<boolean> {
   // Skip if R2 credentials are not configured
   if (!env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY || !env.CF_ACCOUNT_ID) {
     console.log(
@@ -43,9 +63,30 @@ export async function mountR2Storage(sandbox: Sandbox, env: MoltbotEnv): Promise
   }
 
   // Check if already mounted first - this avoids errors and is faster
-  if (await isR2Mounted(sandbox)) {
+  const alreadyMounted = await isR2Mounted(sandbox);
+  if (alreadyMounted && !options.forceRemount) {
     console.log('R2 bucket already mounted at', R2_MOUNT_PATH);
     return true;
+  }
+
+  if (alreadyMounted && options.forceRemount) {
+    // Best-effort unmount. If this fails, we still try mountBucket below,
+    // and fall back gracefully if it errors.
+    try {
+      console.warn('Force remount requested; attempting to unmount stale R2 mount at', R2_MOUNT_PATH);
+      const proc = await sandbox.startProcess(
+        // Prefer umount; fall back to fusermount if present.
+        `umount ${R2_MOUNT_PATH} || (command -v fusermount >/dev/null 2>&1 && fusermount -u ${R2_MOUNT_PATH}) || true`,
+      );
+      let attempts = 0;
+      while (proc.status === 'running' && attempts < 20) {
+        // eslint-disable-next-line no-await-in-loop -- intentional sequential polling
+        await new Promise((r) => setTimeout(r, 200));
+        attempts++;
+      }
+    } catch (err) {
+      console.warn('Force unmount failed (continuing):', err);
+    }
   }
 
   const bucketName = getR2BucketName(env);

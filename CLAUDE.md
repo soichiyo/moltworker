@@ -126,9 +126,31 @@ npm test  # 全テスト実行
 
 ## OpenClaw ノードへの接続
 
-デプロイした Worker を OpenClaw CLI から使用するには:
+**🚨 重要: このプロジェクトはトークン認証を使用しており、ペアリングは不要です。**
 
-### ペアリングコードの取得
+`MOLTBOT_GATEWAY_TOKEN` が wrangler secret として設定されているため、デバイスペアリング手続きをスキップしてトークンで直接接続できます。
+
+### 接続方法（推奨）
+
+```bash
+# 1. ローカルマシンに OpenClaw CLI をインストール
+curl -fsSL https://openclaw.ai/install.sh | bash
+
+# 2. トークンを使って接続
+openclaw connect --url wss://moltbot-sandbox.soichiro0111-dev.workers.dev --token <MOLTBOT_GATEWAY_TOKEN>
+
+# 3. SSH セッションを開始
+openclaw ssh
+```
+
+トークンは wrangler secret として保存されています。確認するには:
+```bash
+npx wrangler secret list
+```
+
+---
+
+### 参考: ペアリングコードの取得（トークン認証を使わない場合）
 
 **Admin UI (`/_admin/`) にはペアリングコードの表示機能がありません。**
 ペアリングコードは Gateway のログに出力されます。
@@ -168,16 +190,13 @@ openclaw pair <PAIRING_CODE>
 openclaw ssh
 ```
 
-### トークン認証を使う場合
+### トークン認証の設定（既に設定済み）
 
-`MOLTBOT_GATEWAY_TOKEN` を設定すれば、デバイスペアリング不要でトークン認証できます:
+このプロジェクトでは既に `MOLTBOT_GATEWAY_TOKEN` が設定されています。新しいトークンに変更する場合:
 
 ```bash
 npx wrangler secret put MOLTBOT_GATEWAY_TOKEN
-# トークンを入力
-
-# 接続時
-openclaw connect --url wss://your-worker.workers.dev --token <TOKEN>
+# 新しいトークンを入力（ランダムな64文字の16進数文字列を推奨）
 ```
 
 ## 詳細なドキュメント

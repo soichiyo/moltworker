@@ -11,9 +11,25 @@
 
 set -e
 
+# If another process already started the gateway, wait for port 18789 to be ready
+# before exiting. Otherwise the caller's waitForPort fails with
+# ProcessExitedBeforeReadyError (we exit 0 but never open the port).
 if pgrep -f "openclaw gateway" > /dev/null 2>&1; then
-    echo "OpenClaw gateway is already running, exiting."
-    exit 0
+    echo "OpenClaw gateway process detected, waiting for port 18789..."
+    for i in $(seq 1 60); do
+        if node -e "
+            const net = require('net');
+            const s = net.createConnection(18789, 'localhost');
+            s.on('connect', () => { s.destroy(); process.exit(0); });
+            s.on('error', () => process.exit(1));
+        " 2>/dev/null; then
+            echo "Port 18789 is ready, another process started the gateway."
+            exit 0
+        fi
+        sleep 2
+    done
+    echo "Timeout waiting for port 18789"
+    exit 1
 fi
 
 # Store config/workspace in R2 mount for immediate persistence
